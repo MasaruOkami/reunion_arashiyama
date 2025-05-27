@@ -5,12 +5,11 @@ on:
     - cron: '0 9 * * *'  # 毎日18時（JST）
   workflow_dispatch:
 
-env:
-  SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
-
 jobs:
   run-multiple-notebooks:
     runs-on: ubuntu-latest
+    env:  # ✅ ここに移動します
+      SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
 
     steps:
       - uses: actions/checkout@v3
