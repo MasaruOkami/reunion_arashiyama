@@ -29,15 +29,15 @@ jobs:
 
       - name: Run Nakagawa
         run: |
-          papermill "中川発明堂スクレイピング.ipynb" "output_中川発明堂スクレイピング.ipynb" \
+          papermill "hirose_scraping.ipynb" "output_hirose_scraping.ipynb" \
             -p SUPABASE_API_KEY "$SUPABASE_API_KEY"
 
       - name: Run Hirose Coffee
         run: |
-          papermill "廣瀬珈琲店スクレイピング.ipynb" "output_廣瀬珈琲店スクレイピング.ipynb" \
+          papermill "hirose_scraping.ipynb" "output_hirose_scraping.ipynb" \
             -p SUPABASE_API_KEY "$SUPABASE_API_KEY"
 
       - name: Run Sagano Yu
         run: |
-          papermill "スクレイピング統合-嵯峨野湯.ipynb" "output_スクレイピング統合-嵯峨野湯.ipynb" \
+          papermill "sagano_yu_scraping.ipynb" "output_sagano_yu_scraping.ipynb" \
             -p SUPABASE_API_KEY "$SUPABASE_API_KEY"
