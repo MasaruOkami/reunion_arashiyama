@@ -1,0 +1,29 @@
+name: Run Nakagawa Notebook
+
+on:
+  schedule:
+    - cron: '0 9 * * *'  # 毎日18時（JST）
+  workflow_dispatch:
+
+env:
+  SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+
+jobs:
+  run-notebook:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install papermill jupyter requests selenium webdriver-manager beautifulsoup4 pytz
+
+      - name: Run Nakagawa Notebook
+        run: |
+          papermill "中川発明堂スクレイピング.ipynb" "output_中川発明堂スクレイピング.ipynb" \
+            -p SUPABASE_API_KEY "$SUPABASE_API_KEY"
