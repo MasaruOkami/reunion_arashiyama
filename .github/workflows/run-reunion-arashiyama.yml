@@ -1,0 +1,393 @@
+import time
+import hashlib
+import json
+import os
+import requests
+import re
+from datetime import datetime, timedelta
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from bs4 import BeautifulSoup
+from webdriver_manager.chrome import ChromeDriverManager
+import pytz # タイムゾーン対応のため
+
+# --- 環境設定 ---
+# Supabase URLとAPIキー。セキュリティのため、本番環境では環境変数を使用することを強く推奨します。
+SUPABASE_URL = "https://oahnmyfalnhdkoihrswh.supabase.co"
+SUPABASE_API_KEY = os.environ.get("SUPABASE_API_KEY", "dummy")
+SUPABASE_TABLE_NAME = "parking_cafe_reunion_arashiyama" # レビューを保存するSupabaseテーブル名
+STORE_ID = "Parking Cafe ReUnion Arashiyama" # 対象店舗のID
+
+# Supabase APIリクエスト用の共通ヘッダー
+HEADERS = {
+    "apikey": SUPABASE_API_KEY,
+    "Authorization": f"Bearer {SUPABASE_API_KEY}",
+    "Content-Type": "application/json"
+}
+
+# --- 補助関数 ---
+
+# 現在時刻をJSTのISO形式で取得 (inserted_at用)
+def jst_now():
+    return datetime.now(pytz.timezone("Asia/Tokyo")).isoformat()
+
+# テキストを安全にfloatに変換。変換できない場合はNoneを返す
+def safe_float(text):
+    try:
+        # 空文字列、ハイフン、全角ハイフンはNoneに
+        return float(text) if text not in ["", "-", "ー"] else None
+    except (ValueError, TypeError):
+        # 変換できない場合はNone
+        return None
+
+# レビューの一意なキーを生成 (SHA256ハッシュ)
+# レビューテキストの冒頭50文字を使用し、スペースなどを除去してハッシュの安定性を高める
+def safe_generate_unique_key(channel, store_id, visit_date, name, review_text):
+    cleaned_review = re.sub(r"\s+", "", (review_text or "").strip().lower())[:50]
+    cleaned_name = (name or "").strip().lower()
+    cleaned_date = (visit_date or "").strip() # visit_dateがNoneの場合に空文字列になるように
+    
+    base = f"{channel}_{store_id}_{cleaned_date}_{cleaned_name}_{cleaned_review}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+# --- WebDriver設定 ---
+
+# WebDriverの初期設定（ヘッドレスモード、自動制御回避など）
+def setup_driver():
+    options = Options()
+    options.add_argument("--headless=new") # 最新のヘッドレスモードを使用
+    options.add_argument("--disable-blink-features=AutomationControlled") # 自動制御を検知させないようにする
+    options.add_argument("--no-sandbox") # DockerやCI/CD環境で必要になる場合がある
+    options.add_argument("--disable-dev-shm-usage") # DockerやCI/CD環境で必要になる場合がある
+    options.add_argument("--window-size=1920,1080") # ウィンドウサイズを設定
+    options.add_argument("--incognito") # シークレットモードで起動
+    
+    # WebDriverManagerでChromeDriverを自動ダウンロード・設定
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=options)
+
+# --- Supabase 関連関数 ---
+
+# 既存のunique_keyをSupabaseから一括取得し、セットで返す
+def fetch_existing_unique_keys():
+    print("🔄 Supabaseから既存のunique_keyを取得中...")
+    response = requests.get(f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE_NAME}?select=unique_key", headers=HEADERS)
+    if response.status_code == 200:
+        existing_keys = {x["unique_key"] for x in response.json()}
+        print(f"✅ 既存のunique_keyを {len(existing_keys)} 件取得しました。")
+        return existing_keys
+    else:
+        print(f"❌ 既存キー取得エラー: {response.status_code} - {response.text}")
+        return set() # エラー時は空のセットを返す
+
+# レビューデータをSupabaseに挿入（重複チェック付き）
+def insert_reviews_to_supabase(reviews_data, existing_keys_set):
+    inserted_count = 0
+    if not reviews_data:
+        print("💡 挿入するレビューデータがありません。")
+        return 0
+
+    print(f"☁️ Supabaseにレビューデータを挿入中（合計 {len(reviews_data)} 件）...")
+    for r in reviews_data:
+        unique_key = r.get('unique_key')
+        if not unique_key:
+            print(f"⚠️ unique_keyがありません。スキップします: {r.get('name', 'N/A')}")
+            continue
+
+        # 既存のキーセットに含まれていればスキップ
+        if unique_key in existing_keys_set:
+            # print(f"⚠️ 重複スキップ: {unique_key} - {r.get('channel', 'N/A')} - {r.get('name', '')} ({r.get('visit_date', '')})")
+            continue
+
+        try:
+            response = requests.post(f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE_NAME}", headers=HEADERS, json=r)
+            if response.status_code in [200, 201]:
+                inserted_count += 1
+                existing_keys_set.add(unique_key) # 新しく挿入されたキーをメモリ上のセットに追加
+                print(f"✅ 保存成功: {r.get('channel', 'N/A')} - {r.get('name', '')} ({r.get('visit_date', '')})")
+            else:
+                print(f"❌ Supabase POSTエラー: {response.status_code} - {response.text} - データunique_key: {unique_key}")
+        except Exception as e:
+            print(f"❌ 保存エラー: {e} - データunique_key: {unique_key}")
+    print(f"📦 Supabaseに新規レビューを {inserted_count} 件保存しました。")
+    return inserted_count
+
+# --- Google Maps スクレイピング関数 ---
+
+# Google Mapsのクチコミタブをクリック
+def click_google_review_tab(driver):
+    try:
+        review_tab = WebDriverWait(driver, 20).until(
+            EC.element_to_be_clickable((By.XPATH, '//button[contains(@aria-label,"クチコミ")]'))
+        )
+        driver.execute_script("arguments[0].click();", review_tab) # JavaScriptでクリックを試みる
+        time.sleep(2) # クリック後の待機時間を長くする
+        print("✅ Google Maps クチコミタブをクリック完了")
+    except Exception as e:
+        print(f"❌ Google Maps クチコミタブクリック失敗: {e}")
+
+# Google Mapsのレビューを「新しい順」で並び替え
+def click_google_sort_by_new(driver):
+    try:
+        # 「並べ替え」ボタンのXPathをより具体的に
+        sort_button = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, '//button[.//span[text()="並べ替え"]]'))
+        )
+        driver.execute_script("arguments[0].click();", sort_button)
+        time.sleep(1) # クリック後の待機
+
+        # 「新しい順」をクリックするためのJavaScript
+        script = '''
+            const elements = Array.from(document.querySelectorAll('div[role="menuitem"]'));
+            const target = elements.find(el => el.textContent.trim() === '新しい順');
+            if (target) { target.click(); return 'clicked'; } else { return 'not found'; }
+        '''
+        result = driver.execute_script(script)
+        print(f"🧭 Google Maps 並び替え『新しい順』クリック結果: {result}")
+        time.sleep(2) # 並び替え適用後の待機時間を長くする
+    except Exception as e:
+        print(f"❌ Google Maps 並び替えクリック失敗: {e}")
+
+# Google Mapsのスクロール可能なレビューエリアを見つける
+def find_google_scrollable_area(driver):
+    print("🔎 Google Maps スクロール対象を探索中...")
+    try:
+        # レビューブロックの最初の要素が存在するまで待機し、その祖先要素からスクロール可能な領域を探す
+        scrollable_div = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, 'div[data-review-id]:first-of-type'))
+        ).find_element(By.XPATH, './ancestor::div[contains(@class, "m6QErb") and contains(@class, "DxyBCb")]')
+        print("✅ Google Maps スクロール対象のレビューセクションを発見")
+        return scrollable_div
+    except Exception as e:
+        print(f"❌ Google Maps スクロール対象が見つかりませんでした: {e}")
+        return None
+
+# Google Mapsのレビューを指定件数または最後までスクロール
+def scroll_google_reviews(driver, scrollable_div, target_reviews=200, max_scrolls=200, patience_scrolls=10):
+    prev_count = 0
+    same_count_times = 0
+    print(f"↘️ Google Maps レビューをスクロール中 (目標: {target_reviews}件)...")
+    for i in range(max_scrolls):
+        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", scrollable_div)
+        time.sleep(0.5) # 短めの待機
+        reviews = driver.find_elements(By.CSS_SELECTOR, 'div.jftiEf')
+        curr_count = len(reviews)
+        # print(f"   スクロール {i+1}回目：現在のレビュー数 = {curr_count}") # デバッグ用
+
+        if curr_count >= target_reviews:
+            print(f"✅ Google Maps {target_reviews}件のレビューに到達 → スクロール終了")
+            break
+        if curr_count == prev_count:
+            same_count_times += 1
+            if same_count_times >= patience_scrolls:
+                print(f"⚠️ Google Maps {patience_scrolls}回連続でレビュー数増加なし → スクロール中断")
+                break
+        else:
+            same_count_times = 0
+            prev_count = curr_count
+    
+    # 全ての「もっと見る」ボタンをクリックして全文を表示
+    try:
+        expand_buttons = driver.find_elements(By.CSS_SELECTOR, 'button.w8nwRe')
+        print(f"👁️‍🗨️ Google Maps 『もっと見る』ボタン {len(expand_buttons)} 個を検出、クリック中...")
+        for btn in expand_buttons:
+            try:
+                driver.execute_script("arguments[0].click();", btn)
+                # time.sleep(0.05) # 短い待機で負荷を減らす
+            except Exception as e:
+                pass # 大量に出力される可能性があるのでエラーメッセージは表示しない
+        print("✅ Google Maps 『もっと見る』ボタンクリック完了")
+    except Exception as e:
+        print(f"❌ Google Maps 『もっと見る』ボタンクリック処理失敗: {e}")
+
+# Google Mapsからレビュー情報を抽出
+def extract_google_reviews(driver):
+    ref_date = datetime.now()  # 基準日（現在日時）
+    reviews = []
+
+    # 完全に展開されたレビューブロックを取得
+    blocks = driver.find_elements(By.CSS_SELECTOR, 'div.jftiEf')
+    print(f"⚙️ Google Maps ページから {len(blocks)} 件のレビューブロックを抽出中...")
+
+    for block in blocks:
+        unique_key = block.get_attribute("data-review-id")
+        if not unique_key:
+            continue  # IDがないレビューはスキップ
+
+        soup = BeautifulSoup(block.get_attribute("innerHTML"), "html.parser")
+
+        review_text_elem = soup.select_one('.MyEned span.wiI7pd')
+        review_text = review_text_elem.text.strip() if review_text_elem else ""
+        if not review_text:
+            continue  # 本文なしはスキップ
+
+        # 投稿日（相対表現 or 絶対表現）
+        visit_date = None
+        visit_month = None
+        try:
+            rating_block = soup.select_one("div.DU9Pgb")
+            if rating_block:
+                publish_span = rating_block.select_one("span.rsqaWe")
+                if publish_span:
+                    txt = publish_span.get_text(strip=True)
+                    visit_datetime = None
+
+                    if "時間前" in txt:
+                        hours = int(re.search(r"\d+", txt).group(0))
+                        visit_datetime = ref_date - timedelta(hours=hours)
+                    elif "日前" in txt:
+                        days = int(re.search(r"\d+", txt).group(0))
+                        visit_datetime = ref_date - timedelta(days=days)
+                    elif "週間前" in txt:
+                        weeks = int(re.search(r"\d+", txt).group(0))
+                        visit_datetime = ref_date - timedelta(weeks=weeks * 7)
+                    elif "か月前" in txt:
+                        months = int(re.search(r"\d+", txt).group(0))
+                        visit_datetime = ref_date - timedelta(days=30 * months)
+                    elif "年前" in txt:
+                        years = int(re.search(r"\d+", txt).group(0))
+                        visit_datetime = ref_date - timedelta(days=365 * years)
+                    elif re.match(r"^\d{4}年\d{1,2}月\d{1,2}日$", txt):
+                        visit_datetime = datetime.strptime(txt, "%Y年%m月%d日")
+                    elif re.match(r"^\d{4}年\d{1,2}月$", txt):
+                        visit_datetime = datetime.strptime(txt, "%Y年%m月")
+
+                    if visit_datetime:
+                        visit_date = visit_datetime.date().isoformat()
+                        visit_month = visit_datetime.replace(day=1).date().isoformat()
+        except Exception as e:
+            print(f"⚠️ Google Maps visit_date 抽出エラー: {e} (元のテキスト: {txt if 'txt' in locals() else 'N/A'})")
+
+        # 総合スコア
+        total_score = None
+        score_elem = soup.select_one('span.kvMYJc[aria-label]')
+        if score_elem and "つ星" in score_elem.get("aria-label", ""):
+            match = re.search(r"(\d+) つ星", score_elem['aria-label'])
+            if match:
+                total_score = int(match.group(1))
+
+        # サブスコア抽出ヘルパー
+        def extract_google_sub_score(label):
+            score = None
+            score_blocks = soup.select("div.PBK6be span.RfDO5c")
+            for block in score_blocks:
+                bold = block.find("b")
+                if bold and label in bold.text:
+                    text = block.get_text(strip=True)
+                    match = re.search(rf"{label}:\s*(\d+)", text)
+                    if match:
+                        score = int(match.group(1))
+                        break
+            return score
+
+        food_score = extract_google_sub_score("食事")
+        service_score = extract_google_sub_score("サービス")
+        atmosphere_score = extract_google_sub_score("雰囲気")
+
+        lunch = "ランチ" in review_text
+        dinner = "ディナー" in review_text
+
+        price_range = None
+        price_elem = soup.find("span", attrs={"aria-label": re.compile(r"￥")})
+        if price_elem:
+            price_range = price_elem['aria-label']
+
+        user_button = soup.select_one('button[aria-label*="さんのクチコミ"]')
+        user_name = user_button['aria-label'].split('さん')[0] if user_button else ""
+        a_tag = soup.select_one('a')
+        user_url = "https://www.google.com" + a_tag['href'] if a_tag else ""
+
+        reviews.append({
+            "store_id": STORE_ID,
+            "channel": "googlemaps",
+            "unique_key": unique_key,
+            "review": review_text,
+            "visit_date": visit_date,
+            "visit_month": visit_month,
+            "name": user_name,
+            "user_url": user_url,
+            "total_score": total_score,
+            "food_score": food_score,
+            "service_score": service_score,
+            "atmosphere_score": atmosphere_score,
+            "lunch": lunch,
+            "dinner": dinner,
+            "price_range": price_range,
+            "inserted_at": jst_now()
+        })
+
+    print(f"📦 Google Mapsから {len(reviews)} 件のレビューを抽出完了")
+    return reviews
+
+# ============ メイン処理 ============
+
+if __name__ == "__main__":
+    # 各サイトのURLを設定
+    # Google Maps URLは、直接Google Mapsの店舗ページURLを使用してください
+    # 例: "https://www.google.com/maps/place/店舗名/@緯度,経度,ズームレベルz/data=!3m1!4b1!4m8!3m7!1s..."
+    # レビュータブが自動で開くURLは、末尾に /reviews を追加すると良い場合があります。
+    google_maps_url = "https://www.google.com/maps/place/Parking+Cafe+ReUnion+Arashiyama/@35.0185282,135.6699421,16z/data=!4m12!1m2!2m1!1sParking+Cafe+ReUnion+Arashiyama!3m8!1s0x6001a97cb260f96d:0x8b89bd9d4be74cbb!8m2!3d35.0185282!4d135.6794693!9m1!1b1!15sCh9QYXJraW5nIENhZmUgUmVVbmlvbiBBcmFzaGl5YW1hWiEiH3BhcmtpbmcgY2FmZSByZXVuaW9uIGFyYXNoaXlhbWGSAQRjYWZlqgFoCg0vZy8xMXZ5d3QxNGcxEAEqECIMcGFya2luZyBjYWZlKAAyHhABIhpdOq0vpJ3wfvgVhz-YkgZsjwej9T-i4uwheTIjEAIiH3BhcmtpbmcgY2FmZSByZXVuaW9uIGFyYXNoaXlhbWHgAQA!16s%2Fg%2F11vywt14g1?entry=ttu&g_ep=EgoyMDI1MDUyMS4wIKXMDSoASAFQAw%3D%3D"
+
+    driver = None # driverを初期化
+    all_reviews = [] # 全サイトから取得したレビューを格納するリスト
+
+    try:
+        driver = setup_driver() # WebDriverを一度だけ初期化
+
+        # 既存のunique_keyをSupabaseから一度だけ取得
+        existing_unique_keys = fetch_existing_unique_keys()
+
+        # --- 各サイトからのレビュー取得と結合 ---
+
+        # Google Maps
+        print("\n=== Google Maps レビュー取得開始 ===")
+        driver.get(google_maps_url)
+        time.sleep(5) # ページが完全にロードされるのを待つ
+        click_google_review_tab(driver)
+        click_google_sort_by_new(driver)
+        scroll_target = find_google_scrollable_area(driver)
+        if scroll_target:
+            scroll_google_reviews(driver, scroll_target, target_reviews=200, max_scrolls=200) # より多くのレビューを試みる
+            google_reviews = extract_google_reviews(driver)
+            all_reviews.extend(google_reviews)
+        else:
+            print("❌ Google Maps レビューエリアが見つからなかったため、スキップします。")
+        print("=== Google Maps レビュー取得完了 ===\n")
+
+        # Tabelog
+        tabelog_reviews = scrape_tabelog(tabelog_url, STORE_ID, driver)
+        all_reviews.extend(tabelog_reviews)
+
+        # Hotpepper
+        hotpepper_reviews = scrape_hotpepper(hotpepper_url, STORE_ID, driver)
+        all_reviews.extend(hotpepper_reviews)
+
+        # Ozmall
+        ozmall_reviews = scrape_ozmall(ozmall_url, STORE_ID, driver)
+        all_reviews.extend(ozmall_reviews)
+
+        # Retty
+        retty_reviews = scrape_retty(retty_url, STORE_ID, driver)
+        all_reviews.extend(retty_reviews)
+
+        # Ikyu
+        ikyu_reviews = scrape_ikyu(ikyu_url, STORE_ID, driver)
+        all_reviews.extend(ikyu_reviews)
+
+    except Exception as e:
+        print(f"致命的なエラーが発生しました: {e}")
+    finally:
+        if driver: # driverがNoneでないことを確認してから終了
+            driver.quit() # 全ての処理が終わったらWebDriverを閉じる
+
+    print(f"\n--- 全サイト合計取得レビュー数: {len(all_reviews)} ---\n")
+
+    # --- 取得した全てのレビューをSupabaseに挿入 ---
+    if all_reviews:
+        insert_reviews_to_supabase(all_reviews, existing_unique_keys)
+    else:
+        print("取得したレビューがありませんでした。Supabaseへの挿入はスキップされます。")
